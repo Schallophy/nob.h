@@ -65,6 +65,66 @@
       If only few specific names create conflicts for you, you can just #undef those names after the
       `#include <nob.h>` without enabling `NOB_UNSTRIP_PREFIX` since they are macros anyway.
 
+   # Fetching Dependencies
+
+      nob.h can automatically download and manage third-party dependencies similar to CMake's FetchContent.
+
+      ```c
+      // nob.c
+      #define NOB_IMPLEMENTATION
+      #include "nob.h"
+
+      int main(int argc, char **argv)
+      {
+          NOB_GO_REBUILD_URSELF(argc, argv);
+
+          // Fetch a single header — .name sets the directory, .url auto-detects as non-archive
+          const char *stb_dir = NULL;
+          if (!nob_fetch_content(&stb_dir,
+              .url = "https://raw.githubusercontent.com/nothings/stb/master/stb_image.h",
+              .name = "stb")) return 1;
+
+          // Fetch an archive — auto-detects .tar.gz/.zip etc., extracts and strips the top-level dir
+          const char *hashmap_dir = NULL;
+          if (!nob_fetch_content(&hashmap_dir,
+              .url = "https://github.com/tidwall/hashmap.c/archive/refs/heads/master.zip",
+              .name = "hashmap")) return 1;
+
+          Nob_Cmd cmd = {0};
+          nob_cc(&cmd);
+          nob_cc_flags(&cmd);
+          nob_cmd_append(&cmd, "-I", stb_dir, "-I", hashmap_dir, "-o", "main", "main.c");
+          if (!nob_cmd_run_sync_and_reset(&cmd)) return 1;
+          return 0;
+      }
+      ```
+
+      For single files the download goes into `_deps/<name>/<filename>`. For archives
+      (.tar.gz, .tar.xz, .tar.bz2, .zip) nob.h extracts and strips the top-level directory
+      automatically. In both cases the returned path is the include directory:
+
+      ```
+      _deps/stb/stb_image.h       <- #include <stb_image.h>
+      _deps/hashmap/hashmap.h     <- #include <hashmap.h>
+      ```
+
+      To change where dependencies are stored, redefine `NOB_DEPS_DIR` before including nob.h:
+
+      ```c
+      #define NOB_DEPS_DIR "build/_deps"
+      #define NOB_IMPLEMENTATION
+      #include "nob.h"
+      ```
+
+      Or pass `deps_dir` per call to override it for a single dependency:
+
+      ```c
+          if (!nob_fetch_content(&dir, .url = "...", .deps_dir = "other/dir")) return 1;
+      ```
+
+      Dependencies are only downloaded once. A stamp file (`<name>/.nob-fetch-stamp`) marks
+      them as fetched — subsequent runs skip the download.
+
    # Macro Interface
 
       All these macros are `#define`d by the user before including nob.h
@@ -953,6 +1013,44 @@ NOBDEF Nob_String_View nob_sv_from_parts(const char *data, size_t count);
 NOBDEF char *nob_win32_error_message(DWORD err);
 
 #endif // _WIN32
+
+// Default directory for fetched dependencies. Redefine before including nob.h to override.
+#ifndef NOB_DEPS_DIR
+#define NOB_DEPS_DIR "_deps"
+#endif
+
+NOBDEF bool nob_download_file(const char *url, const char *output_path);
+
+typedef enum {
+    NOB_FETCH_ARCHIVE_AUTO = 0,
+    NOB_FETCH_ARCHIVE_NONE,
+    NOB_FETCH_ARCHIVE_TAR_GZ,
+    NOB_FETCH_ARCHIVE_TAR_XZ,
+    NOB_FETCH_ARCHIVE_TAR_BZ2,
+    NOB_FETCH_ARCHIVE_ZIP,
+} Nob_Fetch_Archive_Type;
+
+typedef struct {
+    // Required: URL to download.
+    const char *url;
+    // Optional: dependency name. Defaults to the filename portion of the URL.
+    const char *name;
+    // Optional: base directory for dependencies. Defaults to NOB_DEPS_DIR.
+    const char *deps_dir;
+    // Optional: archive type. Defaults to NOB_FETCH_ARCHIVE_AUTO.
+    Nob_Fetch_Archive_Type archive_type;
+    // Optional: number of leading path components to strip during extraction.
+    // 0 (default) means strip 1 component. Set to 1 explicitly to strip 1, or -1 to keep all.
+    int strip_components;
+} Nob_Fetch_Content_Opt;
+
+// Fetch a dependency: download and optionally extract into the deps directory.
+// Returns true on success or if the dependency is already fetched.
+// If include_dir is non-NULL, *include_dir receives a path suitable for -I (temp-allocated).
+NOBDEF bool nob_fetch_content_opt(Nob_Fetch_Content_Opt opt, const char **include_dir);
+
+#define nob_fetch_content(include_dir, ...) \
+    nob_fetch_content_opt(NOB_CLIT(Nob_Fetch_Content_Opt){__VA_ARGS__}, (include_dir))
 
 #endif // NOB_H_
 
@@ -2851,6 +2949,198 @@ NOBDEF char *nob_temp_running_executable_path(void)
 #endif
 }
 
+
+NOBDEF bool nob_download_file(const char *url, const char *output_path)
+{
+    bool result = true;
+    size_t mark = nob_temp_save();
+
+    char *parent = nob_temp_dir_name(output_path);
+    if (parent[0] != '\0') {
+        if (!nob_mkdir_if_not_exists(parent)) nob_return_defer(false);
+    }
+
+    Nob_Cmd cmd = {0};
+    nob_cmd_append(&cmd, "curl", "--fail", "--location", "-o", output_path, url);
+    if (nob_cmd_run(&cmd)) nob_return_defer(true);
+
+    nob_return_defer(false);
+
+defer:
+    nob_temp_rewind(mark);
+    return result;
+}
+
+static Nob_Fetch_Archive_Type nob__fetch_detect_archive_type(const char *url)
+{
+    // Strip query params and fragment for extension detection
+    Nob_String_View sv = nob_sv_from_cstr(url);
+    // Find '?' or '#'
+    for (size_t i = 0; i < sv.count; i++) {
+        if (sv.data[i] == '?' || sv.data[i] == '#') {
+            sv.count = i;
+            break;
+        }
+    }
+    if (nob_sv_ends_with_cstr(sv, ".tar.gz") || nob_sv_ends_with_cstr(sv, ".tgz"))
+        return NOB_FETCH_ARCHIVE_TAR_GZ;
+    if (nob_sv_ends_with_cstr(sv, ".tar.xz"))
+        return NOB_FETCH_ARCHIVE_TAR_XZ;
+    if (nob_sv_ends_with_cstr(sv, ".tar.bz2"))
+        return NOB_FETCH_ARCHIVE_TAR_BZ2;
+    if (nob_sv_ends_with_cstr(sv, ".zip"))
+        return NOB_FETCH_ARCHIVE_ZIP;
+    return NOB_FETCH_ARCHIVE_NONE;
+}
+
+static const char *nob__fetch_clean_url(const char *url)
+{
+    Nob_String_View sv = nob_sv_from_cstr(url);
+    for (size_t i = 0; i < sv.count; i++) {
+        if (sv.data[i] == '?' || sv.data[i] == '#') {
+            sv.count = i;
+            break;
+        }
+    }
+    return nob_temp_sv_to_cstr(sv);
+}
+
+static bool nob__fetch_extract(const char *archive_path, const char *dest_dir,
+                               Nob_Fetch_Archive_Type type, int strip_components)
+{
+    bool result = true;
+
+    if (!nob_mkdir_if_not_exists(dest_dir)) nob_return_defer(false);
+
+    Nob_Cmd cmd = {0};
+
+    switch (type) {
+        case NOB_FETCH_ARCHIVE_TAR_GZ:
+        case NOB_FETCH_ARCHIVE_TAR_XZ:
+        case NOB_FETCH_ARCHIVE_TAR_BZ2: {
+            nob_cmd_append(&cmd, "tar", "-xf", archive_path);
+            if (strip_components > 0) {
+                nob_cmd_append(&cmd, "--strip-components",
+                    nob_temp_sprintf("%d", strip_components));
+            }
+            nob_cmd_append(&cmd, "-C", dest_dir);
+            break;
+        }
+        case NOB_FETCH_ARCHIVE_ZIP: {
+#ifdef _WIN32
+            // Windows tar.exe handles .zip natively
+            nob_cmd_append(&cmd, "tar", "-xf", archive_path);
+            if (strip_components > 0) {
+                nob_cmd_append(&cmd, "--strip-components",
+                    nob_temp_sprintf("%d", strip_components));
+            }
+            nob_cmd_append(&cmd, "-C", dest_dir);
+#elif defined(__APPLE__)
+            // macOS bsdtar handles .zip natively
+            nob_cmd_append(&cmd, "tar", "-xf", archive_path);
+            if (strip_components > 0) {
+                nob_cmd_append(&cmd, "--strip-components",
+                    nob_temp_sprintf("%d", strip_components));
+            }
+            nob_cmd_append(&cmd, "-C", dest_dir);
+#else
+            // Linux: use unzip (no --strip-components support)
+            if (strip_components > 0) {
+                nob_log(NOB_WARNING, "strip_components is not supported for .zip on Linux, extracting as-is");
+            }
+            nob_cmd_append(&cmd, "unzip", "-o", archive_path, "-d", dest_dir);
+#endif
+            break;
+        }
+        default:
+            nob_log(NOB_ERROR, "Unknown archive type for %s", archive_path);
+            nob_return_defer(false);
+    }
+
+    if (!nob_cmd_run(&cmd)) nob_return_defer(false);
+
+defer:
+    return result;
+}
+
+NOBDEF bool nob_fetch_content_opt(Nob_Fetch_Content_Opt opt, const char **include_dir)
+{
+    bool result = true;
+
+    // Resolve name: default to filename from URL
+    const char *name = opt.name;
+    if (!name) {
+        const char *clean_url = nob__fetch_clean_url(opt.url);
+        name = nob_path_name(clean_url);
+    }
+
+    // Resolve deps_dir: default to NOB_DEPS_DIR
+    const char *deps_dir = opt.deps_dir;
+    if (!deps_dir) {
+        deps_dir = NOB_DEPS_DIR;
+    }
+
+    // Compute content directory path
+    const char *content_dir = nob_temp_sprintf("%s/%s", deps_dir, name);
+
+    // Resolve archive type
+    Nob_Fetch_Archive_Type archive_type = opt.archive_type;
+    if (archive_type == NOB_FETCH_ARCHIVE_AUTO) {
+        archive_type = nob__fetch_detect_archive_type(opt.url);
+    }
+
+    // Compute stamp file path
+    const char *stamp_path = nob_temp_sprintf("%s/.nob-fetch-stamp", content_dir);
+
+    // Check if already fetched
+    if (nob_file_exists(stamp_path)) {
+        nob_log(NOB_INFO, "Dependency `%s` already fetched", name);
+        if (include_dir) *include_dir = content_dir;
+        nob_return_defer(true);
+    }
+    if (archive_type == NOB_FETCH_ARCHIVE_NONE && nob_file_exists(content_dir)) {
+        nob_log(NOB_INFO, "Dependency `%s` already downloaded", name);
+        if (include_dir) *include_dir = content_dir;
+        nob_return_defer(true);
+    }
+
+    // Ensure deps_dir exists
+    if (!nob_mkdir_if_not_exists(deps_dir)) nob_return_defer(false);
+
+    // For single-file downloads, create a directory and place the file inside
+    // so that the returned path works as a -I include directory.
+    const char *download_path;
+    const char *file_in_dir = NULL;
+    if (archive_type != NOB_FETCH_ARCHIVE_NONE) {
+        download_path = nob_temp_sprintf("%s/%s.download", deps_dir, name);
+    } else {
+        if (!nob_mkdir_if_not_exists(content_dir)) nob_return_defer(false);
+        file_in_dir = nob_path_name(nob__fetch_clean_url(opt.url));
+        download_path = nob_temp_sprintf("%s/%s", content_dir, file_in_dir);
+    }
+
+    // Download
+    nob_log(NOB_INFO, "Fetching `%s` from %s", name, opt.url);
+    if (!nob_download_file(opt.url, download_path)) nob_return_defer(false);
+
+    // Extract if archive
+    if (archive_type != NOB_FETCH_ARCHIVE_NONE) {
+        int strip = opt.strip_components > 0 ? opt.strip_components : 1;
+        if (!nob__fetch_extract(download_path, content_dir, archive_type, strip)) {
+            nob_return_defer(false);
+        }
+        nob_delete_file(download_path);
+    }
+
+    // Write stamp file
+    nob_write_entire_file(stamp_path, opt.url, strlen(opt.url));
+
+    if (include_dir) *include_dir = content_dir;
+
+defer:
+    return result;
+}
+
 #endif // NOB_IMPLEMENTATION
 
 #ifndef NOB_STRIP_PREFIX_GUARD_
@@ -3022,6 +3312,17 @@ NOBDEF char *nob_temp_running_executable_path(void)
         #define nprocs nob_nprocs
         #define nanos_since_unspecified_epoch nob_nanos_since_unspecified_epoch
         #define NANOS_PER_SEC NOB_NANOS_PER_SEC
+        #define download_file nob_download_file
+        #define Fetch_Archive_Type Nob_Fetch_Archive_Type
+        #define FETCH_ARCHIVE_AUTO NOB_FETCH_ARCHIVE_AUTO
+        #define FETCH_ARCHIVE_NONE NOB_FETCH_ARCHIVE_NONE
+        #define FETCH_ARCHIVE_TAR_GZ NOB_FETCH_ARCHIVE_TAR_GZ
+        #define FETCH_ARCHIVE_TAR_XZ NOB_FETCH_ARCHIVE_TAR_XZ
+        #define FETCH_ARCHIVE_TAR_BZ2 NOB_FETCH_ARCHIVE_TAR_BZ2
+        #define FETCH_ARCHIVE_ZIP NOB_FETCH_ARCHIVE_ZIP
+        #define Fetch_Content_Opt Nob_Fetch_Content_Opt
+        #define fetch_content_opt nob_fetch_content_opt
+        #define fetch_content nob_fetch_content
     #endif // NOB_STRIP_PREFIX
 #endif // NOB_STRIP_PREFIX_GUARD_
 
