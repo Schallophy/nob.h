@@ -1,0 +1,15 @@
+archive_type: OK
+clean_url: OK
+extract_tar_gz_strip1: OK
+extract_tar_gz_strip0: OK
+download_single_file: OK
+download_archive: OK
+cache_hit: OK
+deps_dir_override: OK
+null_include_dir: OK
+name_from_url: OK
+git_to_archive: OK
+git_latest_smoke: OK
+git_url_name: OK
+git_url_name_override: OK
+ALL TESTS PASSED

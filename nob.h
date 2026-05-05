@@ -78,34 +78,39 @@
       {
           NOB_GO_REBUILD_URSELF(argc, argv);
 
+          // Fetch from a git repository URL — just paste the .git URL and set a tag/branch
+          const char *raylib_dir = NULL;
+          if (!nob_fetch_content(&raylib_dir,
+              .url = "https://github.com/raysan5/raylib.git",
+              .tag = "5.0")) return 1;
+
           // Fetch a single header — .name sets the directory, .url auto-detects as non-archive
           const char *stb_dir = NULL;
           if (!nob_fetch_content(&stb_dir,
               .url = "https://raw.githubusercontent.com/nothings/stb/master/stb_image.h",
               .name = "stb")) return 1;
 
-          // Fetch an archive — auto-detects .tar.gz/.zip etc., extracts and strips the top-level dir
-          const char *hashmap_dir = NULL;
-          if (!nob_fetch_content(&hashmap_dir,
-              .url = "https://github.com/tidwall/hashmap.c/archive/refs/heads/master.zip",
-              .name = "hashmap")) return 1;
-
           Nob_Cmd cmd = {0};
           nob_cc(&cmd);
           nob_cc_flags(&cmd);
-          nob_cmd_append(&cmd, "-I", stb_dir, "-I", hashmap_dir, "-o", "main", "main.c");
+          nob_cmd_append(&cmd, "-I", stb_dir, "-I", raylib_dir, "-o", "main", "main.c");
           if (!nob_cmd_run_sync_and_reset(&cmd)) return 1;
           return 0;
       }
       ```
+
+      URLs ending in `.git` are automatically converted to archive download URLs:
+      `https://github.com/owner/repo.git` + `.tag = "v1.0"` becomes
+      `https://github.com/owner/repo/archive/v1.0.tar.gz`. Without `.tag` it fetches
+      the default branch (`HEAD`). This works for any tag, branch, or commit SHA.
 
       For single files the download goes into `_deps/<name>/<filename>`. For archives
       (.tar.gz, .tar.xz, .tar.bz2, .zip) nob.h extracts and strips the top-level directory
       automatically. In both cases the returned path is the include directory:
 
       ```
-      _deps/stb/stb_image.h       <- #include <stb_image.h>
-      _deps/hashmap/hashmap.h     <- #include <hashmap.h>
+      _deps/raylib/...              <- from .git URL with .tag
+      _deps/stb/stb_image.h        <- #include <stb_image.h>
       ```
 
       To change where dependencies are stored, redefine `NOB_DEPS_DIR` before including nob.h:
@@ -1031,13 +1036,17 @@ typedef enum {
 } Nob_Fetch_Archive_Type;
 
 typedef struct {
-    // Required: URL to download.
+    // Required: URL to download. If it ends with ".git", automatically converted to
+    // an archive URL (e.g. https://github.com/owner/repo/archive/{tag}.tar.gz).
     const char *url;
+    // Optional: tag, branch, or commit SHA. Only used when url ends with ".git".
+    // Defaults to "HEAD" (default branch).
+    const char *tag;
     // Optional: dependency name. Defaults to the filename portion of the URL.
     const char *name;
     // Optional: base directory for dependencies. Defaults to NOB_DEPS_DIR.
     const char *deps_dir;
-    // Optional: archive type. Defaults to NOB_FETCH_ARCHIVE_AUTO.
+    // Optional: fetch type. Defaults to NOB_FETCH_ARCHIVE_AUTO (detects from URL).
     Nob_Fetch_Archive_Type archive_type;
     // Optional: number of leading path components to strip during extraction.
     // 0 (default) means strip 1 component. Set to 1 explicitly to strip 1, or -1 to keep all.
@@ -3052,8 +3061,10 @@ static bool nob__fetch_extract(const char *archive_path, const char *dest_dir,
 #endif
             break;
         }
+        case NOB_FETCH_ARCHIVE_AUTO:
+        case NOB_FETCH_ARCHIVE_NONE:
         default:
-            nob_log(NOB_ERROR, "Unknown archive type for %s", archive_path);
+            nob_log(NOB_ERROR, "Unsupported archive type for %s", archive_path);
             nob_return_defer(false);
     }
 
@@ -3063,15 +3074,94 @@ defer:
     return result;
 }
 
+// Resolve "latest" tag by following GitHub's /releases/latest redirect.
+// Extracts the tag name from the final URL (e.g. .../releases/tag/v5.0 → v5.0).
+// Returns the resolved tag (temp-allocated), or "latest" on failure.
+static const char *nob__fetch_resolve_latest(Nob_String_View repo_url)
+{
+    const char *latest_url = nob_temp_sprintf(SV_Fmt"/releases/latest", SV_Arg(repo_url));
+    const char *out_path = nob_temp_sprintf(".nob-latest-tag");
+    Nob_Cmd cmd = {0};
+    nob_cmd_append(&cmd, "curl", "-s", "-L", "-o",
+#ifdef _WIN32
+                   "NUL",
+#else
+                   "/dev/null",
+#endif
+                   "-w", "%{url_effective}", latest_url);
+    if (!nob_cmd_run(&cmd, .stdout_path = out_path)) { free(cmd.items); return "latest"; }
+
+    Nob_String_Builder sb = {0};
+    if (!nob_read_entire_file(out_path, &sb)) { free(sb.items); free(cmd.items); return "latest"; }
+    nob_delete_file(out_path);
+
+    Nob_String_View result = nob_sv_trim_right(nob_sv_from_parts(sb.items, sb.count));
+    // Extract last path segment from the redirect URL
+    Nob_String_View tag = {0};
+    Nob_String_View sv = result;
+    while (sv.count > 0) {
+        tag = nob_sv_chop_by_delim(&sv, '/');
+    }
+    free(sb.items);
+    free(cmd.items);
+    if (tag.count > 0) return nob_temp_sv_to_cstr(tag);
+    return "latest";
+}
+
+// Convert a .git URL to an archive download URL.
+// e.g. "https://github.com/owner/repo.git" + tag="v1.0"
+//    → "https://github.com/owner/repo/archive/v1.0.tar.gz"
+// Returns NULL if url does not end with ".git".
+static const char *nob__fetch_git_to_archive(const char *url, const char *tag)
+{
+    Nob_String_View sv = nob_sv_from_cstr(url);
+    if (!nob_sv_ends_with_cstr(sv, ".git")) return NULL;
+    // Strip ".git"
+    sv.count -= 4;
+
+    const char *ref = tag ? tag : "HEAD";
+    if (tag && strcmp(tag, "latest") == 0) {
+        ref = nob__fetch_resolve_latest(sv);
+    }
+
+    return nob_temp_sprintf(SV_Fmt"/archive/%s.tar.gz", SV_Arg(sv), ref);
+}
+
 NOBDEF bool nob_fetch_content_opt(Nob_Fetch_Content_Opt opt, const char **include_dir)
 {
     bool result = true;
 
+    // Resolve .git URL to archive URL
+    bool is_git_url = false;
+    const char *original_url = opt.url; // keep for stamp file
+    {
+        Nob_String_View sv = nob_sv_from_cstr(opt.url);
+        is_git_url = nob_sv_ends_with_cstr(sv, ".git");
+    }
+    if (is_git_url) {
+        const char *resolved_url = nob__fetch_git_to_archive(opt.url, opt.tag);
+        opt.url = resolved_url;
+    }
+
     // Resolve name: default to filename from URL
     const char *name = opt.name;
     if (!name) {
-        const char *clean_url = nob__fetch_clean_url(opt.url);
-        name = nob_path_name(clean_url);
+        if (is_git_url) {
+            // For .git URLs, name = repo name (without .git)
+            Nob_String_View orig_path = nob_sv_from_cstr(original_url);
+            size_t last_slash = 0;
+            for (size_t i = 0; i < orig_path.count; i++) {
+                if (orig_path.data[i] == '/') last_slash = i;
+            }
+            Nob_String_View name_sv;
+            name_sv.data = orig_path.data + last_slash + 1;
+            name_sv.count = orig_path.count - last_slash - 1;
+            if (nob_sv_ends_with_cstr(name_sv, ".git")) name_sv.count -= 4;
+            name = nob_temp_sv_to_cstr(name_sv);
+        } else {
+            const char *clean_url = nob__fetch_clean_url(opt.url);
+            name = nob_path_name(clean_url);
+        }
     }
 
     // Resolve deps_dir: default to NOB_DEPS_DIR
@@ -3120,7 +3210,7 @@ NOBDEF bool nob_fetch_content_opt(Nob_Fetch_Content_Opt opt, const char **includ
     }
 
     // Download
-    nob_log(NOB_INFO, "Fetching `%s` from %s", name, opt.url);
+    nob_log(NOB_INFO, "Fetching `%s` from %s", name, original_url);
     if (!nob_download_file(opt.url, download_path)) nob_return_defer(false);
 
     // Extract if archive
@@ -3132,8 +3222,14 @@ NOBDEF bool nob_fetch_content_opt(Nob_Fetch_Content_Opt opt, const char **includ
         nob_delete_file(download_path);
     }
 
-    // Write stamp file
-    nob_write_entire_file(stamp_path, opt.url, strlen(opt.url));
+    // Write stamp file (for .git URLs, include the tag so changing it triggers re-download)
+    const char *stamp_content;
+    if (is_git_url && opt.tag) {
+        stamp_content = nob_temp_sprintf("%s %s", original_url, opt.tag);
+    } else {
+        stamp_content = original_url;
+    }
+    nob_write_entire_file(stamp_path, stamp_content, strlen(stamp_content));
 
     if (include_dir) *include_dir = content_dir;
 
